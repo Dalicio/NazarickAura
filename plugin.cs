@@ -1,8 +1,9 @@
 ﻿using BepInEx;
-// Removed BepInEx.Unity.IL2CPP because we compile against BepInEx 5.
+using BepInEx.Unity.IL2CPP;
 using ProjectM;
 using ProjectM.Network;
 using ProjectM.Shared;
+using Stunlock.Core;
 using System.Text;
 using System.Text.Json;
 using Stunlock.Core;
