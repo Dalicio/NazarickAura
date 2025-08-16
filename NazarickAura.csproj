@@ -9,8 +9,8 @@
 		<!-- Ativa imports implícitos de System*, Collections, LINQ, etc. -->
 		<ImplicitUsings>enable</ImplicitUsings>
 		<!-- Nome do assembly gerado -->
-		<AssemblyName>AliasMod</AssemblyName>
-		<RootNamespace>AliasMod</RootNamespace>
+		<AssemblyName>NazarickAura</AssemblyName>
+		<RootNamespace>NazarickAura</RootNamespace>
 	</PropertyGroup>
 
 	<!-- Dependências obtidas via NuGet para COMPILAÇÃO -->

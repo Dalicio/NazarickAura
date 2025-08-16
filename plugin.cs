@@ -6,11 +6,9 @@ using ProjectM.Shared;
 using Stunlock.Core;
 using System.Text;
 using System.Text.Json;
-using Stunlock.Core;
 using Unity.Entities;
 using VampireCommandFramework;
-using KindredCommands;
-using Cpp2IL.Core.Logging;
+
 
 // Wrap everything in a normal namespace block rather than a file‑scoped namespace
 namespace NazarickAura
@@ -29,8 +27,7 @@ namespace NazarickAura
     {
         public static World? World { get; private set; }
         public static EntityManager EntityManager { get; private set; }
-        // Nullable because it may be missing on some server contexts
-        public static DebugEventsSystem? DebugEventsSystem { get; private set; }
+        public static DebugEventsSystem DebugEventsSystem { get; private set; }
         private static BepInEx.Logging.ManualLogSource? _log;
 
         /// <summary>
@@ -72,6 +69,14 @@ namespace NazarickAura
             }
             return null;
         }
+
+        /// <summary>
+        /// Returns the logger associated with the server context. Used by helpers to log errors.
+        /// </summary>
+        public static BepInEx.Logging.ManualLogSource? GetLogger()
+        {
+            return _log;
+        }
     }
 
     /// <summary>
@@ -83,7 +88,7 @@ namespace NazarickAura
     /// </summary>
     [BepInPlugin(GUID, Name, Version)]
     [BepInDependency("gg.deca.VampireCommandFramework")]
-    public class NazarickAuraPlugin : BaseUnityPlugin
+    public class NazarickAuraPlugin : BasePlugin
     {
         public const string GUID = "user.NazarickAura";
         public const string Name = "NazarickAura";
@@ -93,25 +98,40 @@ namespace NazarickAura
         // VampireCommandFramework to register commands at load time.
 
         /// <summary>
-        /// Unity callback invoked when the plugin instance is created. We use
-        /// this to load the aura configuration, locate the server world and
-        /// register chat commands. This replaces the BepInEx 6 Load() method
-        /// so that the mod is compatible with the Oakveil Update on BepInEx 5.
+        /// Called by BepInEx when the plugin is loaded. We use this to load
+        /// configuration and apply Harmony patches. This replaces the Mono
+        /// specific Awake() method used in previous versions.
         /// </summary>
-        private void Awake()
+        public override void Load()
         {
-            Logger.LogInfo($"[{Name}] Carregando configuração de auras...");
+            Log.LogInfo($"[{Name}] Carregando configuração de auras...");
             AuraManager.LoadAuras();
-            // Initialise our server context using BepInEx's logger
-            ServerContext.Initialize(Logger);
-            // Register all commands in this assembly via VampireCommandFramework
-            CommandRegistry.RegisterAll();
-            Logger.LogInfo($"[{Name}] Inicializado com sucesso.");
+            // Inicialização tardia: tenta inicializar o contexto do servidor até o mundo estar disponível
+            System.Threading.Tasks.Task.Run(async () =>
+            {
+                while (ServerContext.World == null)
+                {
+                    ServerContext.Initialize(Log);
+                    if (ServerContext.World == null)
+                        await System.Threading.Tasks.Task.Delay(1000); // Espera 1 segundo antes de tentar de novo
+                }
+                // Só registra comandos após o mundo estar disponível
+                CommandRegistry.RegisterAll();
+                Log.LogInfo($"[{Name}] Inicializado com sucesso.");
+            });
         }
 
-        // Note: Commands are registered for the lifetime of the plugin. There
-        // is no need to explicitly unregister them on unload when using
-        // VampireCommandFramework with BepInEx 5.
+        /// <summary>
+        /// Optional cleanup. When BepInEx unloads the plugin, unpatch Harmony
+        /// methods to avoid leaving patched state behind. BepInEx calls this
+        /// method if implemented.
+        /// </summary>
+        public override bool Unload()
+        {
+            // Unregister commands when the plugin is unloaded to clean up
+            CommandRegistry.UnregisterAssembly();
+            return true;
+        }
     }
 
     /// <summary>
@@ -148,7 +168,7 @@ namespace NazarickAura
                 {
                     new AuraConfigItem
                     {
-                        Aura = "ChamasBonitas",
+                        Aura = "Demoniaca",
                         Prefab = -93395631,
                         Numero = 1
                     }
@@ -209,13 +229,8 @@ namespace NazarickAura
     {
         public static bool AddBuff(Entity User, Entity Character, PrefabGUID buffPrefab, int duration = 0, bool immortal = true)
         {
-            // Obtain the DebugEventsSystem from the cached server context
+            var em = ServerContext.EntityManager;
             var des = ServerContext.DebugEventsSystem;
-            if (des == null)
-            {
-                // Could not locate debug system; cannot apply buff
-                return false;
-            }
             var buffEvent = new ApplyBuffDebugEvent()
             {
                 BuffPrefabGUID = buffPrefab
@@ -225,62 +240,47 @@ namespace NazarickAura
                 User = User,
                 Character = Character
             };
-            if (!BuffUtility.TryGetBuff(ServerContext.EntityManager, Character, buffPrefab, out Entity buffEntity))
+            if (!BuffUtility.TryGetBuff(em, Character, buffPrefab, out Entity buffEntity))
             {
                 des.ApplyBuff(fromCharacter, buffEvent);
-                if (BuffUtility.TryGetBuff(ServerContext.EntityManager, Character, buffPrefab, out buffEntity))
+                if (BuffUtility.TryGetBuff(em, Character, buffPrefab, out buffEntity))
                 {
-                    if (buffEntity.Has<CreateGameplayEventsOnSpawn>())
-                    {
-                        buffEntity.Remove<CreateGameplayEventsOnSpawn>();
-                    }
-                    if (buffEntity.Has<GameplayEventListeners>())
-                    {
-                        buffEntity.Remove<GameplayEventListeners>();
-                    }
+                    // Remove componentes se existirem
+                    if (em.HasComponent<CreateGameplayEventsOnSpawn>(buffEntity))
+                        em.RemoveComponent<CreateGameplayEventsOnSpawn>(buffEntity);
+                    if (em.HasComponent<GameplayEventListeners>(buffEntity))
+                        em.RemoveComponent<GameplayEventListeners>(buffEntity);
 
                     if (immortal)
                     {
-                        buffEntity.Add<Buff_Persists_Through_Death>();
-                        if (buffEntity.Has<RemoveBuffOnGameplayEvent>())
-                        {
-                            buffEntity.Remove<RemoveBuffOnGameplayEvent>();
-                        }
-                        if (buffEntity.Has<RemoveBuffOnGameplayEventEntry>())
-                        {
-                            buffEntity.Remove<RemoveBuffOnGameplayEventEntry>();
-                        }
+                        if (!em.HasComponent<Buff_Persists_Through_Death>(buffEntity))
+                            em.AddComponent<Buff_Persists_Through_Death>(buffEntity);
+                        if (em.HasComponent<RemoveBuffOnGameplayEvent>(buffEntity))
+                            em.RemoveComponent<RemoveBuffOnGameplayEvent>(buffEntity);
+                        if (em.HasComponent<RemoveBuffOnGameplayEventEntry>(buffEntity))
+                            em.RemoveComponent<RemoveBuffOnGameplayEventEntry>(buffEntity);
                     }
                     if (duration > -1 && duration != 0)
                     {
-                        if (!buffEntity.Has<LifeTime>())
-                        {
-                            buffEntity.Add<LifeTime>();
-                            buffEntity.Write(new LifeTime
-                            {
-                                EndAction = LifeTimeEndAction.Destroy
-                            });
-                        }
-                        var lifetime = buffEntity.Read<LifeTime>();
+                        if (!em.HasComponent<LifeTime>(buffEntity))
+                            em.AddComponent<LifeTime>(buffEntity);
+                        var lifetime = em.GetComponentData<LifeTime>(buffEntity);
                         lifetime.Duration = duration;
-                        buffEntity.Write(lifetime);
+                        lifetime.EndAction = LifeTimeEndAction.Destroy;
+                        em.SetComponentData(buffEntity, lifetime);
                     }
                     else if (duration == -1)
                     {
-                        if (buffEntity.Has<LifeTime>())
+                        if (em.HasComponent<LifeTime>(buffEntity))
                         {
-                            var lifetime = buffEntity.Read<LifeTime>();
+                            var lifetime = em.GetComponentData<LifeTime>(buffEntity);
                             lifetime.EndAction = LifeTimeEndAction.None;
-                            buffEntity.Write(lifetime);
+                            em.SetComponentData(buffEntity, lifetime);
                         }
-                        if (buffEntity.Has<RemoveBuffOnGameplayEvent>())
-                        {
-                            buffEntity.Remove<RemoveBuffOnGameplayEvent>();
-                        }
-                        if (buffEntity.Has<RemoveBuffOnGameplayEventEntry>())
-                        {
-                            buffEntity.Remove<RemoveBuffOnGameplayEventEntry>();
-                        }
+                        if (em.HasComponent<RemoveBuffOnGameplayEvent>(buffEntity))
+                            em.RemoveComponent<RemoveBuffOnGameplayEvent>(buffEntity);
+                        if (em.HasComponent<RemoveBuffOnGameplayEventEntry>(buffEntity))
+                            em.RemoveComponent<RemoveBuffOnGameplayEventEntry>(buffEntity);
                     }
                     return true;
                 }
@@ -297,9 +297,12 @@ namespace NazarickAura
 
         public static void RemoveBuff(Entity Character, PrefabGUID buffPrefab)
         {
-            if (BuffUtility.TryGetBuff(ServerContext.EntityManager, Character, buffPrefab, out var buffEntity))
+            var em = ServerContext.EntityManager;
+            // Only attempt to remove the buff if the character exists
+            if (!em.Exists(Character)) return;
+            if (BuffUtility.TryGetBuff(em, Character, buffPrefab, out var buffEntity) && em.Exists(buffEntity))
             {
-                DestroyUtility.Destroy(ServerContext.EntityManager, buffEntity, DestroyDebugReason.TryRemoveBuff);
+                DestroyUtility.Destroy(em, buffEntity, DestroyDebugReason.TryRemoveBuff);
             }
         }
     }
@@ -317,7 +320,7 @@ namespace NazarickAura
     {
         internal static class AuraCommands
         {
-            [Command("aura", description: "Ativa ou desativa uma aura por número ou nome; use .aura list para listar todas as auras", adminOnly: true)]
+            [Command("aura", "ar", "a", description: "Ativa ou desativa uma aura por número ou nome; use .aura list para listar todas as auras", adminOnly: true)]
             public static void AuraCommand(ChatCommandContext ctx, string arg)
             {
                 if (string.IsNullOrWhiteSpace(arg))
@@ -329,6 +332,7 @@ namespace NazarickAura
                     string.Equals(arg, "lista", StringComparison.OrdinalIgnoreCase))
                 {
                     var sb = new StringBuilder();
+                    sb.AppendLine("Lista Completa:");
                     foreach (var aura in AuraManager.Auras)
                     {
                         sb.AppendLine($"{aura.Numero}. {aura.Aura}");
@@ -345,17 +349,77 @@ namespace NazarickAura
                 var buffPrefab = new PrefabGUID(auraItem.Prefab);
                 var userEntity = ctx.Event.SenderUserEntity;
                 var charEntity = ctx.Event.SenderCharacterEntity;
-                // Check if the buff is already applied
-                if (BuffUtility.TryGetBuff(ServerContext.EntityManager, charEntity, buffPrefab, out var buffEntity))
+                // Defensive checks to avoid crashing the server when entities are invalid
+                var em = ServerContext.EntityManager;
+                var world = ServerContext.World;
+                if (world == null)
                 {
-                    Buffs.RemoveBuff(charEntity, buffPrefab);
-                    ctx.Reply($"A aura {auraItem.Aura} foi desativada.");
+                    ctx.Reply("[NazarickAura] Mundo do servidor não inicializado.");
+                    return;
                 }
+                if (userEntity.Index < 0 || charEntity.Index < 0 || !em.Exists(charEntity) || !em.Exists(userEntity))
+                {
+                    ctx.Reply("[NazarickAura] Não foi possível resolver sua entidade de personagem/usuário. Tente relogar.");
+                    return;
+                }
+
+                try
+                {
+                    // Check if the buff is already applied
+                    if (BuffUtility.TryGetBuff(em, charEntity, buffPrefab, out var buffEntity))
+                    {
+                        Buffs.RemoveBuff(charEntity, buffPrefab);
+                        ctx.Reply($"A aura {auraItem.Aura} foi desativada.");
+                    }
+                    else
+                    {
+                        if (Buffs.AddBuff(userEntity, charEntity, buffPrefab, duration: -1, immortal: true))
+                        {
+                            ctx.Reply($"A aura {auraItem.Aura} foi ativada.");
+                        }
+                        else
+                        {
+                            ctx.Reply("[NazarickAura] Falha ao aplicar a aura (verifique o log do servidor).");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ServerContext.GetLogger()?.LogError($"[NazarickAura] Exceção no toggle de aura: {ex}");
+                    ctx.Reply("[NazarickAura] Ocorreu um erro ao alternar a aura.");
+                }
+            }
+
+            [Command("removeaura", "ra", description: "Remove todas as auras ativas do personagem.", adminOnly: true)]
+            public static void RemoveAuraCommand(ChatCommandContext ctx)
+            {
+                var em = ServerContext.EntityManager;
+                var world = ServerContext.World;
+                var charEntity = ctx.Event.SenderCharacterEntity;
+                if (world == null)
+                {
+                    ctx.Reply("[NazarickAura] Mundo do servidor não inicializado.");
+                    return;
+                }
+                if (charEntity.Index < 0 || !em.Exists(charEntity))
+                {
+                    ctx.Reply("[NazarickAura] Não foi possível resolver sua entidade de personagem. Tente relogar.");
+                    return;
+                }
+                int removed = 0;
+                foreach (var aura in AuraManager.Auras)
+                {
+                    var buffPrefab = new PrefabGUID(aura.Prefab);
+                    if (BuffUtility.TryGetBuff(em, charEntity, buffPrefab, out var buffEntity))
+                    {
+                        Buffs.RemoveBuff(charEntity, buffPrefab);
+                        removed++;
+                    }
+                }
+                if (removed > 0)
+                    ctx.Reply($"Todas as auras ({removed}) foram removidas.");
                 else
-                {
-                    Buffs.AddBuff(userEntity, charEntity, buffPrefab, duration: -1, immortal: true);
-                    ctx.Reply($"A aura {auraItem.Aura} foi ativada.");
-                }
+                    ctx.Reply("Nenhuma aura ativa foi encontrada para remover.");
             }
         }
     }
